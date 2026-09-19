@@ -7,6 +7,20 @@ import "github.com/projectdiscovery/katana/pkg/engine/headless/crawler"
 // See crawler.Hooks for field-level documentation and semantics.
 type Hooks = crawler.Hooks
 
+// StageName re-exports the pipeline stage identifier used by BeforeStage and
+// AfterStage callbacks.
+type StageName = crawler.StageName
+
+// Pipeline stage names re-exported for use in BeforeStage/AfterStage hooks.
+const (
+	StageActionProcessor    = crawler.StageActionProcessor
+	StageNavigator          = crawler.StageNavigator
+	StageCaptchaHandler     = crawler.StageCaptchaHandler
+	StageAuthHandler        = crawler.StageAuthHandler
+	StageDiscoveryCollector = crawler.StageDiscoveryCollector
+	StageGraphWriter        = crawler.StageGraphWriter
+)
+
 // SetHooks installs lifecycle callbacks on the headless engine. The supplied
 // struct is copied, so mutating it after SetHooks returns has no effect on the
 // engine; call SetHooks again to change the installed hooks. Passing nil clears

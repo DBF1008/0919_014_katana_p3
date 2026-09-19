@@ -1,16 +1,15 @@
 package crawler
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"strings"
 
-	graphlib "github.com/dominikbraun/graph"
 	"github.com/pkg/errors"
 	"github.com/projectdiscovery/katana/pkg/engine/headless/browser"
-	"github.com/projectdiscovery/katana/pkg/engine/headless/crawler/diagnostics"
 	"github.com/projectdiscovery/katana/pkg/engine/headless/crawler/normalizer/simhash"
 	"github.com/projectdiscovery/katana/pkg/engine/headless/types"
 )
@@ -117,19 +116,20 @@ func getStrippedDOM(contents string) (string, error) {
 
 var ErrNoNavigationPossible = errors.New("no navigation possible")
 
-// navigateBackToStateOrigin implements the logic to navigate back to the state origin
+// navigateBackToStateOrigin restores the browser to the state from which
+// action.OriginID was recorded. The actual mechanics are delegated to the
+// configured NavigationStrategyChain, whose default priority is:
 //
-// It implements different logics as an optimization to decide
-// how to navigate back.
+//  1. Element visibility: if the action's element is already visible and
+//     identity-matches on the current page, interact directly.
+//  2. Browser history: if the origin entry is still in the browser history,
+//     walk back to it.
+//  3. Shortest path (BFS): replay the shortest recorded action path in the
+//     crawl graph (from the blank state when necessary).
 //
-//  1. If the action has an element, check if the element is visible on the current page
-//     If the element is visible, directly use that to navigate.
-//
-//  2. If we have browser history, and the page is in the history which was the origin
-//     of the action, then we can directly use the browser history to navigate back.
-//
-// 3. If all else fails, we have the shortest path navigation.
-func (c *Crawler) navigateBackToStateOrigin(action *types.Action, page *browser.BrowserPage, currentPageHash string) (string, error) {
+// Additional strategies can be registered via Options.NavigationStrategies or
+// SetNavigationStrategies without touching this method or the chain logic.
+func (c *Crawler) navigateBackToStateOrigin(ctx context.Context, action *types.Action, page *browser.BrowserPage, currentPageHash string) (string, error) {
 	c.logger.Debug("Found action with different origin id",
 		slog.String("action_origin_id", action.OriginID),
 		slog.String("current_page_hash", currentPageHash),
@@ -142,190 +142,12 @@ func (c *Crawler) navigateBackToStateOrigin(action *types.Action, page *browser.
 		return "", err
 	}
 
-	// First, check if the element we want to interact with exists on current page
-	if action.Element != nil && currentPageHash != emptyPageHash {
-		newPageHash, err := c.tryElementNavigation(page, action, currentPageHash)
-		if err != nil {
-			c.logger.Debug("Failed to navigate back to origin page using element", slog.String("error", err.Error()))
-		}
-		if newPageHash != "" {
-			return newPageHash, nil
-		}
-	}
-
-	// Try to see if we can move back using the browser history
-	newPageHash, err := c.tryBrowserHistoryNavigation(page, originPageState, action)
-	if err != nil {
-		c.logger.Debug("Failed to navigate back using browser history", slog.String("error", err.Error()))
-	}
-	if newPageHash != "" {
-		return newPageHash, nil
-	}
-
-	// Finally try Shortest path walking from root.
-	newPageHash, err = c.tryShortestPathNavigation(action, page, currentPageHash)
-	if err != nil {
-		return "", err
-	}
-	if newPageHash == "" {
-		return "", ErrNoNavigationPossible
-	}
-	return newPageHash, nil
-}
-
-func (c *Crawler) tryElementNavigation(page *browser.BrowserPage, action *types.Action, currentPageHash string) (string, error) {
-	element, err := page.ElementX(action.Element.XPath)
-	if err != nil {
-		return "", err
-	}
-	visible, err := element.Visible()
-	if err != nil {
-		return "", err
-	}
-	if !visible {
-		return "", nil
-	}
-
-	// Also ensure its interactable
-	interactable, err := element.Interactable()
-	if err != nil || interactable == nil {
-		return "", nil
-	}
-
-	// Ensure its the same element
-	htmlElement, err := page.GetElementFromXpath(action.Element.XPath)
-	if err != nil {
-		return "", err
-	}
-	// Ensure its the same element with stronger identity matching
-	if isElementMatch(htmlElement, action.Element) {
-		c.logger.Debug("Found target element on current page, proceeding without navigation")
-		// FIXME: Return the origin element ID so that the graph shows
-		// correctly the fastest way to reach the state.
-		return action.OriginID, nil
-	}
-	return "", nil
-}
-
-// isElementMatch implements stronger identity matching logic to reduce false positives.
-// It treats identical ID as definitive match, otherwise requires both Classes and TextContent
-// to match, or enforces at least two matching non-empty attributes.
-func isElementMatch(current, target *types.HTMLElement) bool {
-	if current == nil || target == nil {
-		return false
-	}
-	// Definitive match: identical non-empty IDs
-	if current.ID != "" && target.ID != "" && current.ID == target.ID {
-		return true
-	}
-	matchCount := 0
-
-	if current.Classes != "" && target.Classes != "" && current.Classes == target.Classes {
-		matchCount++
-	}
-	if current.TextContent != "" && target.TextContent != "" && current.TextContent == target.TextContent {
-		matchCount++
-	}
-	if current.TagName != "" && target.TagName != "" && current.TagName == target.TagName {
-		matchCount++
-	}
-	// Require at least two matching non-empty attributes for a positive match
-	// This ensures stronger identity verification while still allowing reasonable fallbacks
-	return matchCount >= 2
-}
-
-func (c *Crawler) tryBrowserHistoryNavigation(page *browser.BrowserPage, originPageState *types.PageState, action *types.Action) (string, error) {
-	canNavigateBack, stepsBack, err := c.isBackNavigationPossible(page, originPageState)
-	if err != nil {
-		return "", err
-	}
-	if !canNavigateBack {
-		return "", nil
-	}
-
-	c.logger.Debug("Navigating back using browser history", slog.Int("steps_back", stepsBack))
-
-	var navigatedSuccessfully bool
-	for i := 0; i < stepsBack; i++ {
-		err := runWithNavigateBackHook(c.options.Hooks, page, page.NavigateBack)
-		if err != nil {
-			return "", err
-		}
-		navigatedSuccessfully = true
-	}
-
-	if !navigatedSuccessfully {
-		return "", nil
-	}
-
-	if err := page.WaitPageLoadHeurisitics(); err != nil {
-		c.logger.Debug("Failed to wait for page load after navigating back using browser history", slog.String("error", err.Error()))
-	}
-	newPageHash, pageState, err := c.isCorrectNavigation(page, action)
-	if c.diagnostics != nil && pageState != nil {
-		if err := c.diagnostics.LogPageState(pageState, diagnostics.PreActionPageState); err != nil {
-			return "", err
-		}
-	}
-	if err != nil {
-		return "", err
-	}
-	return newPageHash, nil
-}
-
-func (c *Crawler) isBackNavigationPossible(page *browser.BrowserPage, originPage *types.PageState) (bool, int, error) {
-	history, err := page.GetNavigationHistory()
-	if err != nil {
-		return false, 0, err
-	}
-	if len(history.Entries) == 0 {
-		return false, 0, nil
-	}
-
-	currentIndex := history.CurrentIndex
-	for i, entry := range history.Entries {
-		if entry.URL == originPage.URL && originPage.Title == entry.Title {
-			stepsBack := currentIndex - i
-			return true, stepsBack, nil
-		}
-	}
-	return false, 0, nil
-}
-
-func (c *Crawler) tryShortestPathNavigation(action *types.Action, page *browser.BrowserPage, currentPageHash string) (string, error) {
-	c.logger.Debug("Trying Shortest path to navigate back to origin page", slog.String("action_origin_id", action.OriginID), slog.String("current_page_hash", currentPageHash))
-
-	actions, err := c.crawlGraph.ShortestPath(currentPageHash, action.OriginID)
-	if err != nil {
-		if errors.Is(err, graphlib.ErrTargetNotReachable) {
-			c.logger.Debug("Target not reachable, reaching from blank state",
-				slog.String("action_origin_id", action.OriginID),
-			)
-
-			actions, err = c.crawlGraph.ShortestPath(emptyPageHash, action.OriginID)
-			if err != nil {
-				return "", errors.Wrap(err, "could not find path to origin page")
-			}
-		} else {
-			return "", errors.Wrap(err, "failed to find shortest path")
-		}
-	}
-	c.logger.Debug("Found actions to traverse",
-		slog.Any("actions", actions),
-	)
-	for _, action := range actions {
-		if err := c.executeCrawlStateAction(action, page); err != nil {
-			return "", err
-		}
-	}
-	newPageHash, pageState, err := c.isCorrectNavigation(page, action)
-	if c.diagnostics != nil && pageState != nil {
-		if err := c.diagnostics.LogPageState(pageState, diagnostics.PreActionPageState); err != nil {
-			return "", err
-		}
-	}
-	if err != nil {
-		return "", err
-	}
-	return newPageHash, nil
+	return c.navigationStrategies.Restore(&NavigationContext{
+		Ctx:         ctx,
+		Crawler:     c,
+		Action:      action,
+		Page:        page,
+		Origin:      originPageState,
+		CurrentHash: currentPageHash,
+	})
 }
