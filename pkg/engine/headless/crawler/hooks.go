@@ -8,7 +8,17 @@ import (
 // Hooks bundles optional lifecycle callbacks invoked by the headless crawler.
 // All fields are optional; nil callbacks are skipped.
 //
-// Callbacks run synchronously on the crawler's own goroutine and block its
+// The callbacks mirror the crawler's pipeline lifecycle:
+//
+//   - BeforeStage / AfterStage bracket every pipeline stage (navigator,
+//     action-processor, captcha-handler, auth-handler, discovery-collector,
+//     graph-writer) for each crawled action.
+//   - BeforeAction / AfterAction bracket the dispatch of the crawl action
+//     itself, inside the action-processor stage.
+//   - BeforeNavigateBack brackets each browser-history back step performed
+//     by the browser-history navigation strategy during state restoration.
+//
+// Callbacks run synchronously on the crawler's own goroutines and block its
 // progress for their duration — they should return quickly. A non-nil error
 // returned from any callback aborts the surrounding crawl step and is
 // propagated back to the caller of Crawl.
@@ -23,6 +33,15 @@ import (
 // read-only — navigating, closing, or otherwise mutating it from inside a
 // callback races with the crawler.
 type Hooks struct {
+	// BeforeStage is invoked just before a pipeline stage processes a work
+	// item. A non-nil error aborts the item: the stage is skipped and the
+	// error is propagated as the item's result.
+	BeforeStage func(stage string, action *types.Action) error
+	// AfterStage is invoked only after a pipeline stage completes
+	// successfully. It is not called when the stage returns an error or the
+	// item was terminated by the stage. A non-nil error from AfterStage is
+	// recorded as the item's error.
+	AfterStage func(stage string, action *types.Action) error
 	// BeforeAction is invoked just before each action is dispatched, including
 	// actions that will subsequently fail. A non-nil error aborts the action.
 	BeforeAction func(page *browser.BrowserPage, action *types.Action) error

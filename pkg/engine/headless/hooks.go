@@ -4,6 +4,10 @@ import "github.com/projectdiscovery/katana/pkg/engine/headless/crawler"
 
 // Hooks re-exports crawler.Hooks so library users can configure headless
 // lifecycle callbacks without importing the internal crawler sub-package.
+// The callbacks align with the crawler's pipeline lifecycle: stage-level
+// callbacks (BeforeStage/AfterStage) bracket each pipeline stage, while
+// action-level (BeforeAction/AfterAction) and navigation-level
+// (BeforeNavigateBack) callbacks fire inside the corresponding stages.
 // See crawler.Hooks for field-level documentation and semantics.
 type Hooks = crawler.Hooks
 
